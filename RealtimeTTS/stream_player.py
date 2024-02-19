@@ -1,6 +1,8 @@
 """
 Stream management
 """
+import base64
+import json
 
 from pydub import AudioSegment
 import threading
@@ -9,6 +11,7 @@ import logging
 import queue
 import time
 import io
+from flask_sock import Server
 
 
 class AudioConfiguration:
@@ -26,6 +29,177 @@ class AudioConfiguration:
         self.format = format
         self.channels = channels
         self.rate = rate
+
+class WebsocketAudioStream:
+    """
+    Handles audio stream operations such as opening, starting, stopping, and closing.
+    """
+
+    def __init__(self, config: AudioConfiguration, ws: Server, stream_sid: str):
+        """
+        Args:
+            config (AudioConfiguration): Object containing audio settings.
+        """
+        self.config = config
+        self.ws = ws
+        self.stream_sid = stream_sid
+
+    def write(self, chunk):
+        
+        payload = base64.b64encode(chunk).decode("utf-8")
+        
+        message = {
+            "streamSid": self.stream_sid,
+            "event": "media",
+            "media": {
+                "payload": payload
+            }
+        }
+
+        #TODO send mark
+        self.ws.send(json.dumps(message))
+    # TODO auf finish warten
+    def clear_websocket(self):
+        """Stops the audio stream."""
+        message = {
+                    "streamSid": self.stream_sid,
+                    "event": "clear",
+                }
+
+        self.ws.send(json.dumps(message))
+    
+class WebsocketPlayer:
+    """
+    Manages audio playback operations such as start, stop, pause, and resume.
+    """
+
+    def __init__(self, audio_buffer: queue.Queue, config: AudioConfiguration, ws: Server, stream_sid: str,  on_playback_start=None, on_playback_stop=None, on_audio_chunk=None, muted = False):
+        """
+        Args:
+            audio_buffer (queue.Queue): Queue to be used as the audio buffer.
+            config (AudioConfiguration): Object containing audio settings.
+            on_playback_start (Callable, optional): Callback function to be called at the start of playback. Defaults to None.
+            on_playback_stop (Callable, optional): Callback function to be called at the stop of playback. Defaults to None.
+        """
+        self.buffer_manager = AudioBufferManager(audio_buffer)
+        self.audio_stream = WebsocketAudioStream(config, ws, stream_sid)
+        self.playback_active = False
+        self.immediate_stop = threading.Event()
+        self.pause_event = threading.Event()
+        self.playback_thread = None
+        self.on_playback_start = on_playback_start
+        self.on_playback_stop = on_playback_stop
+        self.on_audio_chunk = on_audio_chunk
+        self.first_chunk_played = False
+        self.muted = muted
+
+    def _play_chunk(self, chunk):
+        """
+        Plays a chunk of audio data.
+
+        Args:
+            chunk: Chunk of audio data to be played.
+        """
+
+        # handle mpeg
+        #if self.audio_stream.config.format == pyaudio.paCustomFormat:
+
+            # convert to pcm using pydub
+         #   segment = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
+          #  chunk = segment.raw_data
+
+        sub_chunk_size = 1024
+        
+        for i in range(0, len(chunk), sub_chunk_size):
+            sub_chunk = chunk[i:i + sub_chunk_size]
+
+            if not self.muted:
+                self.audio_stream.write(sub_chunk)
+
+            if self.on_audio_chunk:
+                self.on_audio_chunk(sub_chunk)
+
+            if not self.first_chunk_played and self.on_playback_start:
+                self.on_playback_start()
+                self.first_chunk_played = True            
+
+            # Pause playback if the event is set
+            while self.pause_event.is_set():
+                time.sleep(0.01)
+
+            if self.immediate_stop.is_set():
+                break
+
+    def _process_buffer(self):
+        """Processes and plays audio data from the buffer until it's empty or playback is stopped."""
+        while self.playback_active or not self.buffer_manager.audio_buffer.empty():
+            chunk = self.buffer_manager.get_from_buffer()
+            if chunk:
+                self._play_chunk(chunk)
+
+            if self.immediate_stop.is_set():
+                logging.info("Immediate stop requested, aborting playback")
+                break
+        if self.on_playback_stop:
+            self.on_playback_stop()
+            
+    def get_buffered_seconds(self) -> float:
+        """
+        Calculates the duration (in seconds) of the buffered audio data.
+
+        Returns:
+            float: Duration of buffered audio in seconds.
+        """
+        total_samples = sum(len(chunk) // 2 for chunk in list(self.buffer_manager.audio_buffer.queue))
+        return total_samples / self.audio_stream.config.rate
+
+    def start(self):
+        """Starts audio playback."""
+        self.first_chunk_played = False
+        self.playback_active = True
+        self.playback_thread = threading.Thread(target=self._process_buffer)
+        self.playback_thread.start()
+
+    def stop(self, immediate: bool = False):
+        """
+        Stops audio playback.
+
+        Args:
+            immediate (bool): If True, stops playback immediately without waiting for buffer to empty.
+        """
+        if not self.playback_thread:
+            logging.warn("No playback thread found, cannot stop playback")
+            return
+
+        if immediate:
+            self.audio_stream.clear_websocket()
+            self.immediate_stop.set()
+            while self.playback_active:
+                time.sleep(0.1)
+            return
+        
+        self.playback_active = False
+
+        if self.playback_thread and self.playback_thread.is_alive():
+            self.playback_thread.join()
+
+        time.sleep(0.1)
+
+        self.immediate_stop.clear()
+        self.buffer_manager.clear_buffer()
+        self.playback_thread = None
+
+    def pause(self):
+        """Pauses audio playback."""
+        self.pause_event.set()
+
+    def resume(self):
+        """Resumes paused audio playback."""
+        self.pause_event.clear()
+
+    def mute(self, muted: bool = True):
+        """Mutes audio playback."""
+        self.muted = muted
 
 
 class AudioStream:

@@ -1,5 +1,5 @@
 from .threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
-from .stream_player import StreamPlayer, AudioConfiguration
+from .stream_player import StreamPlayer, WebsocketPlayer, AudioConfiguration
 from typing import Union, Iterator, List
 from .engines import BaseEngine
 import stream2sentence as s2s
@@ -11,6 +11,8 @@ import pyaudio
 import queue
 import time
 import wave
+
+from flask_sock import Server
 
 class TextToAudioStream:
 
@@ -25,6 +27,8 @@ class TextToAudioStream:
                  tokenizer: str = "nltk",
                  language: str = "en",
                  level=logging.WARNING,
+                 ws: Server = None,
+                 stream_sid: str = None
                  ):
         """
         Initializes the TextToAudioStream.
@@ -57,6 +61,8 @@ class TextToAudioStream:
         self.tokenizer = tokenizer
         self.language = language
         self.player = None
+        self.ws = ws
+        self.stream_sid  = stream_sid
 
         self._create_iterators()
 
@@ -102,11 +108,11 @@ class TextToAudioStream:
         format, channels, rate = self.engine.get_stream_info()
 
         # Check if the engine doesn't support consuming generators directly
-        if not self.engine.can_consume_generators:
+        
+        if not self.ws or not self.stream_sid:
             self.player = StreamPlayer(self.engine.queue, AudioConfiguration(format, channels, rate), on_playback_start=self._on_audio_stream_start)
         else:
-            self.engine.on_playback_start = self._on_audio_stream_start
-            self.player = None
+            self.player = WebsocketPlayer(self.engine.queue, AudioConfiguration(format, channels, rate), ws= self.ws, stream_sid=self.stream_sid, on_playback_start=self._on_audio_stream_start)
 
         logging.info(f"loaded engine {self.engine.engine_name}")
 
@@ -220,132 +226,109 @@ class TextToAudioStream:
         if reset_generated_text:
             self.generated_text = ""
 
-        # Check if the engine can handle generators directly
-        if self.engine.can_consume_generators:
+        try:
+            # Start the audio player to handle playback
+            self.player.start()
+            self.player.on_audio_chunk = self._on_audio_chunk
 
+            # Generate sentences from the characters
+            generate_sentences = s2s.generate_sentences(self.thread_safe_char_iter, context_size=context_size, minimum_sentence_length=minimum_sentence_length, minimum_first_fragment_length=minimum_first_fragment_length, quick_yield_single_sentence_fragment=fast_sentence_fragment, cleanup_text_links=True, cleanup_text_emojis=True, tokenizer=tokenizer, language=language, log_characters=self.log_characters)
+
+            # Create the synthesis chunk generator with the given sentences
+            chunk_generator = self._synthesis_chunk_generator(generate_sentences, buffer_threshold_seconds, log_synthesized_text)
+
+            sentence_queue = queue.Queue()
+
+            def synthesize_worker():
+                while not abort_event.is_set():
+                    sentence = sentence_queue.get()
+                    if sentence is None:  # Sentinel value to stop the worker
+                        break
+
+                    synthesis_successful = False
+                    if log_synthesized_text:
+                        logging.info(f"synthesizing: {sentence}")
+
+                    while not synthesis_successful:
+                        try:
+                            if abort_event.is_set():
+                                break
+                            success = self.engine.synthesize(sentence)
+                            if success:
+                                if on_sentence_synthesized:
+                                    on_sentence_synthesized(sentence)
+                                synthesis_successful = True
+                            else:
+                                logging.warning(f"engine {self.engine.engine_name} failed to synthesize sentence \"{sentence}\", unknown error")
+
+                        except Exception as e:
+                            logging.warning(f"engine {self.engine.engine_name} failed to synthesize sentence \"{sentence}\" with error: {e}")
+                            tb_str = traceback.format_exc()
+                            print (f"Traceback: {tb_str}")
+                            print (f"Error: {e}")                                
+
+                        if not synthesis_successful:
+                            if len(self.engines) == 1:
+                                time.sleep(0.2)
+                                logging.warning(f"engine {self.engine.engine_name} is the only engine available, can't switch to another engine")
+                                break
+                            else:
+                                logging.warning(f"fallback engine(s) available, switching to next engine")
+                                self.engine_index = (self.engine_index + 1) % len(self.engines)
+
+                                self.player.stop()
+                                self.load_engine(self.engines[self.engine_index])
+                                self.player.start()
+                                self.player.on_audio_chunk = self._on_audio_chunk
+
+                    sentence_queue.task_done()
+
+
+            worker_thread = threading.Thread(target=synthesize_worker)
+            worker_thread.start()      
+
+            # Iterate through the synthesized chunks and feed them to the engine for audio synthesis
+            for sentence in chunk_generator:
+                if abort_event.is_set():
+                    break
+                sentence = sentence.strip()
+                sentence_queue.put(sentence)
+                if not self.stream_running:
+                    break
+
+            # Signal to the worker to stop
+            sentence_queue.put(None)
+            worker_thread.join()   
+
+        except Exception as e:
+            logging.warning(f"error in play() with engine {self.engine.engine_name}: {e}")
+            tb_str = traceback.format_exc()
+            print (f"Traceback: {tb_str}")
+            print (f"Error: {e}")
+
+        finally:
             try:
-                # Directly synthesize audio using the character iterator
-                self.char_iter.log_characters = self.log_characters
+                
+                self.player.stop()
 
-                self.engine.on_audio_chunk = self._on_audio_chunk
-                self.engine.synthesize(self.char_iter)
-
-                if self.on_audio_stream_stop:
-                    self.on_audio_stream_stop()
-
-            finally:
-                # Once done, set the stream running flag to False and log the stream stop
+                self.abort_events.remove(abort_event)
                 self.stream_running = False
                 logging.info("stream stop")
 
-                # Accumulate the generated text and reset the character iterators
-                self.generated_text += self.char_iter.iterated_text
+                self.output_wavfile = None
+                self.chunk_callback = None
 
-                self._create_iterators()
-        else:
-            try:
-                # Start the audio player to handle playback
-                self.player.start()
-                self.player.on_audio_chunk = self._on_audio_chunk
-
-                # Generate sentences from the characters
-                generate_sentences = s2s.generate_sentences(self.thread_safe_char_iter, context_size=context_size, minimum_sentence_length=minimum_sentence_length, minimum_first_fragment_length=minimum_first_fragment_length, quick_yield_single_sentence_fragment=fast_sentence_fragment, cleanup_text_links=True, cleanup_text_emojis=True, tokenizer=tokenizer, language=language, log_characters=self.log_characters)
-
-                # Create the synthesis chunk generator with the given sentences
-                chunk_generator = self._synthesis_chunk_generator(generate_sentences, buffer_threshold_seconds, log_synthesized_text)
-
-                sentence_queue = queue.Queue()
-
-                def synthesize_worker():
-                    while not abort_event.is_set():
-                        sentence = sentence_queue.get()
-                        if sentence is None:  # Sentinel value to stop the worker
-                            break
-
-                        synthesis_successful = False
-                        if log_synthesized_text:
-                            logging.info(f"synthesizing: {sentence}")
-
-                        while not synthesis_successful:
-                            try:
-                                if abort_event.is_set():
-                                    break
-                                success = self.engine.synthesize(sentence)
-                                if success:
-                                    if on_sentence_synthesized:
-                                        on_sentence_synthesized(sentence)
-                                    synthesis_successful = True
-                                else:
-                                    logging.warning(f"engine {self.engine.engine_name} failed to synthesize sentence \"{sentence}\", unknown error")
-
-                            except Exception as e:
-                                logging.warning(f"engine {self.engine.engine_name} failed to synthesize sentence \"{sentence}\" with error: {e}")
-                                tb_str = traceback.format_exc()
-                                print (f"Traceback: {tb_str}")
-                                print (f"Error: {e}")                                
-
-                            if not synthesis_successful:
-                                if len(self.engines) == 1:
-                                    time.sleep(0.2)
-                                    logging.warning(f"engine {self.engine.engine_name} is the only engine available, can't switch to another engine")
-                                    break
-                                else:
-                                    logging.warning(f"fallback engine(s) available, switching to next engine")
-                                    self.engine_index = (self.engine_index + 1) % len(self.engines)
-
-                                    self.player.stop()
-                                    self.load_engine(self.engines[self.engine_index])
-                                    self.player.start()
-                                    self.player.on_audio_chunk = self._on_audio_chunk
-
-                        sentence_queue.task_done()
-
-
-                worker_thread = threading.Thread(target=synthesize_worker)
-                worker_thread.start()      
-
-                # Iterate through the synthesized chunks and feed them to the engine for audio synthesis
-                for sentence in chunk_generator:
-                    if abort_event.is_set():
-                        break
-                    sentence = sentence.strip()
-                    sentence_queue.put(sentence)
-                    if not self.stream_running:
-                        break
-
-                # Signal to the worker to stop
-                sentence_queue.put(None)
-                worker_thread.join()   
-
-            except Exception as e:
-                logging.warning(f"error in play() with engine {self.engine.engine_name}: {e}")
-                tb_str = traceback.format_exc()
-                print (f"Traceback: {tb_str}")
-                print (f"Error: {e}")
-
+                if reset_generated_text and self.on_audio_stream_stop:
+                    self.on_audio_stream_stop()
             finally:
-                try:
-                   
-                    self.player.stop()
+                if output_wavfile and self.wf:
+                    self.wf.close()
+                    self.wf = None
 
-                    self.abort_events.remove(abort_event)
-                    self.stream_running = False
-                    logging.info("stream stop")
-
-                    self.output_wavfile = None
-                    self.chunk_callback = None
-
-                    if reset_generated_text and self.on_audio_stream_stop:
-                        self.on_audio_stream_stop()
-                finally:
-                    if output_wavfile and self.wf:
-                        self.wf.close()
-                        self.wf = None
-
-            if len(self.char_iter.items) > 0 and self.char_iter.iterated_text == "":
-                # new text was feeded while playing audio but after the last character was processed
-                # we need to start another play() call
-                self.play(fast_sentence_fragment, buffer_threshold_seconds, minimum_sentence_length, log_synthesized_text, reset_generated_text=False)
+        if len(self.char_iter.items) > 0 and self.char_iter.iterated_text == "":
+            # new text was feeded while playing audio but after the last character was processed
+            # we need to start another play() call
+            self.play(fast_sentence_fragment, buffer_threshold_seconds, minimum_sentence_length, log_synthesized_text, reset_generated_text=False)
 
 
     def pause(self):
@@ -354,10 +337,7 @@ class TextToAudioStream:
         """
         if self.is_playing():
             logging.info("stream pause")
-            if self.engine.can_consume_generators:
-                self.engine.pause()
-            else:
-                self.player.pause()
+            self.player.pause()
 
 
     def resume(self):
@@ -367,28 +347,20 @@ class TextToAudioStream:
         """
         if self.is_playing():
             logging.info("stream resume")
-            if self.engine.can_consume_generators:
-                self.engine.resume()
-            else:
-                self.player.resume()
+            self.player.resume()
 
 
     def stop(self):
         """
         Stops the playback of the synthesized audio stream immediately.
         """
-
         for abort_event in self.abort_events:
             abort_event.set()
-    
+
         if self.is_playing():
             self.char_iter.stop()
-            if self.engine.can_consume_generators:
-                if self.engine.stop():
-                    self.stream_running = False
-            else:
-                self.player.stop(immediate=True)
-                self.stream_running = False
+            self.player.stop(immediate=True)
+            self.stream_running = False
 
         if self.play_thread is not None:
             if self.play_thread.is_alive():
